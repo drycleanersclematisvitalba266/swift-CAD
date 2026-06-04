@@ -1,0 +1,150 @@
+import CADCore
+
+public struct Body: Codable, Equatable, Sendable {
+    public var id: BodyID
+    public var shellIDs: [ShellID]
+    public var name: String?
+    public var material: MaterialID?
+
+    public init(id: BodyID = BodyID(), shellIDs: [ShellID], name: String? = nil, material: MaterialID? = nil) {
+        self.id = id
+        self.shellIDs = shellIDs
+        self.name = name
+        self.material = material
+    }
+}
+
+public struct Shell: Codable, Equatable, Sendable {
+    public var id: ShellID
+    public var faceIDs: [FaceID]
+    public var orientation: Orientation
+
+    public init(id: ShellID = ShellID(), faceIDs: [FaceID], orientation: Orientation = .forward) {
+        self.id = id
+        self.faceIDs = faceIDs
+        self.orientation = orientation
+    }
+}
+
+public struct Face: Codable, Equatable, Sendable {
+    public var id: FaceID
+    public var surfaceID: SurfaceID
+    public var loops: [LoopID]
+    public var orientation: Orientation
+
+    public init(id: FaceID = FaceID(), surfaceID: SurfaceID, loops: [LoopID], orientation: Orientation = .forward) {
+        self.id = id
+        self.surfaceID = surfaceID
+        self.loops = loops
+        self.orientation = orientation
+    }
+}
+
+public enum LoopRole: String, Codable, Equatable, Sendable {
+    case outer
+    case inner
+}
+
+public struct Loop: Codable, Equatable, Sendable {
+    public var id: LoopID
+    public var role: LoopRole
+    public var edges: [OrientedEdge]
+
+    public init(id: LoopID = LoopID(), role: LoopRole = .outer, edges: [OrientedEdge]) {
+        self.id = id
+        self.role = role
+        self.edges = edges
+    }
+}
+
+public struct OrientedEdge: Codable, Equatable, Sendable {
+    public var edgeID: EdgeID
+    public var orientation: Orientation
+
+    public init(edgeID: EdgeID, orientation: Orientation = .forward) {
+        self.edgeID = edgeID
+        self.orientation = orientation
+    }
+}
+
+public struct Edge: Codable, Equatable, Sendable {
+    public var id: EdgeID
+    public var curveID: CurveID
+    public var startVertexID: VertexID
+    public var endVertexID: VertexID
+    public var trim: CurveTrim?
+
+    public init(
+        id: EdgeID = EdgeID(),
+        curveID: CurveID,
+        startVertexID: VertexID,
+        endVertexID: VertexID,
+        trim: CurveTrim? = nil
+    ) {
+        self.id = id
+        self.curveID = curveID
+        self.startVertexID = startVertexID
+        self.endVertexID = endVertexID
+        self.trim = trim
+    }
+}
+
+public struct CurveTrim: Codable, Hashable, Sendable {
+    public var startParameter: Double
+    public var endParameter: Double
+
+    public init(startParameter: Double, endParameter: Double) {
+        self.startParameter = startParameter
+        self.endParameter = endParameter
+    }
+
+    @available(
+        *,
+        deprecated,
+        message: "Use validate(on:edgeID:tolerance:) for curve-specific trim validation."
+    )
+    public func validate(edgeID: EdgeID, tolerance: ModelingTolerance = .standard) throws {
+        try validateFiniteParameters(edgeID: edgeID, tolerance: tolerance)
+    }
+
+    public func validate(on curve: Curve3D, edgeID: EdgeID, tolerance: ModelingTolerance = .standard) throws {
+        try validateFiniteParameters(edgeID: edgeID, tolerance: tolerance)
+        guard try curve.parameterDomain.containsSpan(
+            from: startParameter,
+            to: endParameter,
+            tolerance: tolerance
+        ) else {
+            throw TopologyError.invalidTrim(edgeID)
+        }
+        let span = abs(endParameter - startParameter)
+        switch curve {
+        case .line:
+            guard span > tolerance.distance else {
+                throw TopologyError.invalidTrim(edgeID)
+            }
+        case .circle:
+            guard span > tolerance.angle,
+                  span < (Double.pi * 2.0) - tolerance.angle else {
+                throw TopologyError.invalidTrim(edgeID)
+            }
+        }
+    }
+
+    public func validateFiniteParameters(edgeID: EdgeID, tolerance: ModelingTolerance = .standard) throws {
+        try tolerance.validate()
+        guard startParameter.isFinite,
+              endParameter.isFinite else {
+            throw TopologyError.invalidTrim(edgeID)
+        }
+    }
+}
+
+public struct Vertex: Codable, Equatable, Sendable {
+    public var id: VertexID
+    public var point: Point3D
+
+    public init(id: VertexID = VertexID(), point: Point3D) {
+        self.id = id
+        self.point = point
+    }
+}

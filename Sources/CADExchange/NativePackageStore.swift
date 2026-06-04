@@ -1,0 +1,919 @@
+import Foundation
+import CADCore
+import CADIR
+
+public struct NativePackageStore: Sendable {
+    public init() {}
+
+    public func writePackage(for document: CADDocument, to sink: any ByteSink) throws {
+        try document.validate()
+        let encoder = nativePackageJSONEncoder()
+
+        let manifest = NativePackageManifest(
+            format: "swiftcad.package",
+            schemaVersion: document.schemaVersion,
+            documentPath: "document.json",
+            createdAt: document.metadata.createdAt,
+            updatedAt: document.metadata.updatedAt
+        )
+
+        let manifestData = try encoder.encode(manifest)
+        let documentData = try canonicalNativeDocumentJSONData(from: encoder.encode(document))
+        try StoredZipArchive.write(entries: [
+            StoredZipArchive.Entry(path: "manifest.json", data: manifestData),
+            StoredZipArchive.Entry(path: "document.json", data: documentData)
+        ], to: sink)
+    }
+
+    public func loadDocument(from source: any ByteSource) throws -> CADDocument {
+        do {
+            return try StoredZipArchive.withEntries(from: source) { entries in
+                try loadDocument(fromPackageEntries: entries)
+            }
+        } catch let error as ZipArchiveError {
+            throw SchemaError.invalidPackage("Invalid native ZIP package: \(error).")
+        } catch {
+            throw error
+        }
+    }
+
+    private func loadDocument(fromPackageEntries entries: [String: Data]) throws -> CADDocument {
+        try validateNativePackageEntries(entries)
+        guard let manifestData = entries["manifest.json"],
+              let documentData = entries["document.json"] else {
+            throw SchemaError.invalidPackage("Missing manifest.json or document.json.")
+        }
+        try validateNativePackageJSONShape(manifestData: manifestData, documentData: documentData)
+
+        let decoder = nativePackageJSONDecoder()
+        let manifest: NativePackageManifest
+        do {
+            manifest = try decoder.decode(NativePackageManifest.self, from: manifestData)
+        } catch {
+            throw SchemaError.invalidPackage("Manifest JSON is invalid: \(error).")
+        }
+        guard manifest.format == "swiftcad.package" else {
+            throw SchemaError.invalidPackage("Invalid package format.")
+        }
+        guard manifest.documentPath == "document.json" else {
+            throw SchemaError.invalidPackage("Unsupported document path.")
+        }
+        let decodedDocument: CADDocument
+        do {
+            let decodableDocumentData = try canonicalNativeDocumentJSONData(from: documentData)
+            decodedDocument = try decoder.decode(CADDocument.self, from: decodableDocumentData)
+        } catch {
+            throw SchemaError.invalidPackage("Document JSON is invalid: \(error).")
+        }
+        let document = decodedDocument
+        guard manifest.schemaVersion == document.schemaVersion else {
+            throw SchemaError.invalidPackage("Manifest schema version does not match document schema version.")
+        }
+        try document.validate()
+        try validateManifest(manifest, matches: document)
+        return document
+    }
+
+    public func save(_ document: CADDocument, to url: URL) throws {
+        do {
+            try writeFileAtomically(to: url) { sink in
+                try writePackage(for: document, to: sink)
+            }
+        } catch let error as ByteSinkError {
+            throw ExportError.fileWriteFailure(error.localizedDescription)
+        }
+    }
+
+    public func load(from url: URL) throws -> CADDocument {
+        do {
+            return try loadDocument(from: MappedFileByteSource(url: url))
+        } catch let error as ByteSourceError {
+            throw ImportError.fileReadFailure(error.localizedDescription)
+        } catch {
+            throw error
+        }
+    }
+}
+
+private struct NativePackageManifest: Codable, Sendable {
+    var format: String
+    var schemaVersion: SchemaVersion
+    var documentPath: String
+    var createdAt: Date
+    var updatedAt: Date
+}
+
+private func nativePackageJSONEncoder() -> JSONEncoder {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    encoder.dateEncodingStrategy = .custom { date, encoder in
+        var container = encoder.singleValueContainer()
+        try container.encode(date.timeIntervalSinceReferenceDate)
+    }
+    return encoder
+}
+
+private func nativePackageJSONDecoder() -> JSONDecoder {
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .custom { decoder in
+        try decodeNativePackageDate(from: decoder)
+    }
+    return decoder
+}
+
+private func canonicalNativeDocumentJSONData(from data: Data) throws -> Data {
+    guard var object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        throw SchemaError.invalidPackage("Document JSON must be an object.")
+    }
+    try sortNativeDynamicObjectField(at: ["parameters", "parameters"][...], in: &object)
+    try sortNativeDynamicObjectField(at: ["designGraph", "nodes"][...], in: &object)
+    try sortNativeSketchEntityFields(in: &object)
+    return try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+}
+
+private func sortNativeDynamicObjectField(at path: ArraySlice<String>, in object: inout [String: Any]) throws {
+    guard let key = path.first else {
+        throw SchemaError.invalidPackage("Expected native dynamic object path.")
+    }
+    if path.count == 1 {
+        guard let value = object[key] else {
+            return
+        }
+        object[key] = try sortedNativeDynamicObjectValue(value, path: key)
+        return
+    }
+    guard var nestedObject = object[key] as? [String: Any] else {
+        return
+    }
+    try sortNativeDynamicObjectField(at: path.dropFirst(), in: &nestedObject)
+    object[key] = nestedObject
+}
+
+private struct NativeDynamicJSONPair {
+    var key: String
+    var logicalKey: String
+    var value: Any
+}
+
+private func sortedNativeDynamicObjectValue(_ value: Any, path: String) throws -> Any {
+    if let dictionary = value as? [String: Any] {
+        let entries = try dictionary.map { key, value in
+            NativeDynamicJSONPair(
+                key: key,
+                logicalKey: try canonicalNativeDynamicDictionaryKey(key, path: path),
+                value: value
+            )
+        }
+        var sortedPairs: [Any] = []
+        for entry in entries.sorted(by: { $0.logicalKey < $1.logicalKey }) {
+            sortedPairs.append(entry.key)
+            sortedPairs.append(entry.value)
+        }
+        return sortedPairs
+    }
+    guard let pairs = value as? [Any] else {
+        return value
+    }
+    guard pairs.count.isMultiple(of: 2) else {
+        throw SchemaError.invalidPackage("Native \(path) dictionary must contain key/value pairs.")
+    }
+    var entries: [NativeDynamicJSONPair] = []
+    var valueIndex = 1
+    while valueIndex < pairs.count {
+        guard let key = pairs[valueIndex - 1] as? String else {
+            throw SchemaError.invalidPackage("Native \(path) dictionary key must be a string.")
+        }
+        entries.append(NativeDynamicJSONPair(
+            key: key,
+            logicalKey: try canonicalNativeDynamicDictionaryKey(key, path: path),
+            value: pairs[valueIndex]
+        ))
+        valueIndex += 2
+    }
+    var sortedPairs: [Any] = []
+    for entry in entries.sorted(by: { $0.logicalKey < $1.logicalKey }) {
+        sortedPairs.append(entry.key)
+        sortedPairs.append(entry.value)
+    }
+    return sortedPairs
+}
+
+private func sortNativeSketchEntityFields(in document: inout [String: Any]) throws {
+    guard var designGraph = document["designGraph"] as? [String: Any] else {
+        return
+    }
+    if var nodes = designGraph["nodes"] as? [Any] {
+        var valueIndex = 1
+        while valueIndex < nodes.count {
+            if var node = nodes[valueIndex] as? [String: Any] {
+                try sortNativeSketchEntityField(in: &node)
+                nodes[valueIndex] = node
+            }
+            valueIndex += 2
+        }
+        designGraph["nodes"] = nodes
+    } else if var nodes = designGraph["nodes"] as? [String: Any] {
+        for key in nodes.keys {
+            if var node = nodes[key] as? [String: Any] {
+                try sortNativeSketchEntityField(in: &node)
+                nodes[key] = node
+            }
+        }
+        designGraph["nodes"] = nodes
+    }
+    document["designGraph"] = designGraph
+}
+
+private func sortNativeSketchEntityField(in node: inout [String: Any]) throws {
+    guard var operation = node["operation"] as? [String: Any],
+          var sketch = operation["sketch"] as? [String: Any],
+          let entities = sketch["entities"] else {
+        return
+    }
+    sketch["entities"] = try sortedNativeDynamicObjectValue(
+        entities,
+        path: "document.designGraph.nodes.operation.sketch.entities"
+    )
+    operation["sketch"] = sketch
+    node["operation"] = operation
+}
+
+private func decodeNativePackageDate(from decoder: Decoder) throws -> Date {
+    let container = try decoder.singleValueContainer()
+    do {
+        let value = try container.decode(Double.self)
+        guard value.isFinite else {
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "Native package date timestamp must be finite."
+            )
+        }
+        return Date(timeIntervalSinceReferenceDate: value)
+    } catch DecodingError.typeMismatch {
+    } catch DecodingError.valueNotFound {
+    } catch {
+        throw error
+    }
+
+    let string = try container.decode(String.self)
+    if let date = nativePackageDate(fromISOString: string) {
+        return date
+    }
+    throw DecodingError.dataCorruptedError(
+        in: container,
+        debugDescription: "Native package date must be reference-date seconds or an ISO 8601 timestamp."
+    )
+}
+
+private func nativePackageDate(fromISOString string: String) -> Date? {
+    let fractionalFormatter = ISO8601DateFormatter()
+    fractionalFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = fractionalFormatter.date(from: string) {
+        return date
+    }
+
+    let wholeSecondFormatter = ISO8601DateFormatter()
+    wholeSecondFormatter.formatOptions = [.withInternetDateTime]
+    return wholeSecondFormatter.date(from: string)
+}
+
+private let supportedNativeManifestKeys: Set<String> = [
+    "format",
+    "schemaVersion",
+    "documentPath",
+    "createdAt",
+    "updatedAt"
+]
+
+private let supportedNativeDocumentKeys: Set<String> = [
+    "id",
+    "schemaVersion",
+    "units",
+    "parameters",
+    "designGraph",
+    "metadata"
+]
+
+private let supportedNativePackageEntries: Set<String> = [
+    "manifest.json",
+    "document.json"
+]
+
+private func validateManifest(_ manifest: NativePackageManifest, matches document: CADDocument) throws {
+    let created = manifest.createdAt.timeIntervalSinceReferenceDate
+    let updated = manifest.updatedAt.timeIntervalSinceReferenceDate
+    guard created.isFinite, updated.isFinite else {
+        throw SchemaError.invalidPackage("Manifest timestamps must be finite.")
+    }
+    guard manifest.updatedAt >= manifest.createdAt else {
+        throw SchemaError.invalidPackage("Manifest updatedAt must not be earlier than createdAt.")
+    }
+    guard manifest.createdAt == document.metadata.createdAt,
+          manifest.updatedAt == document.metadata.updatedAt else {
+        throw SchemaError.invalidPackage("Manifest timestamps do not match document metadata.")
+    }
+}
+
+private func validateNativePackageEntries(_ entries: [String: Data]) throws {
+    let unsupportedEntries = Set(entries.keys).subtracting(supportedNativePackageEntries)
+    guard unsupportedEntries.isEmpty else {
+        let entry = unsupportedEntries.sorted().first ?? "unknown"
+        throw SchemaError.invalidPackage("Unsupported native package entry \(entry).")
+    }
+}
+
+private func validateNativePackageJSONShape(manifestData: Data, documentData: Data) throws {
+    let manifest = try nativeJSONObject(from: manifestData, name: "Manifest")
+    try validateNativeManifestObject(manifest)
+
+    let document = try nativeJSONObject(from: documentData, name: "Document")
+    try validateNativeDocumentObject(document)
+}
+
+private func validateNativeManifestObject(_ object: [String: Any]) throws {
+    try rejectUnsupportedNativeKeys(
+        in: object,
+        supportedKeys: supportedNativeManifestKeys,
+        objectName: "manifest"
+    )
+    try validateObjectField("schemaVersion", in: object, path: "manifest.schemaVersion", using: validateSchemaVersionObject)
+}
+
+private func validateNativeDocumentObject(_ object: [String: Any]) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: supportedNativeDocumentKeys, objectName: "document")
+    try validateObjectField("schemaVersion", in: object, path: "document.schemaVersion", using: validateSchemaVersionObject)
+    try validateObjectField("units", in: object, path: "document.units", using: validateUnitSystemObject)
+    try validateObjectField("parameters", in: object, path: "document.parameters", using: validateParameterTableObject)
+    try validateObjectField("designGraph", in: object, path: "document.designGraph", using: validateDesignGraphObject)
+    try validateObjectField("metadata", in: object, path: "document.metadata", using: validateDocumentMetadataObject)
+}
+
+private func validateSchemaVersionObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["major", "minor", "patch"], objectName: path)
+}
+
+private func validateDocumentRevisionObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["value"], objectName: path)
+}
+
+private func validateUnitSystemObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["length", "angle"], objectName: path)
+}
+
+private func validateDocumentMetadataObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["name", "createdAt", "updatedAt"], objectName: path)
+}
+
+private func validateParameterTableObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["parameters", "revision"], objectName: path)
+    try validateDynamicObjectField("parameters", in: object, path: "\(path).parameters", using: validateParameterObject)
+    try validateObjectField("revision", in: object, path: "\(path).revision", using: validateDocumentRevisionObject)
+}
+
+private func validateParameterObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["id", "name", "expression", "kind"], objectName: path)
+    try validateObjectField("expression", in: object, path: "\(path).expression", using: validateExpressionObject)
+}
+
+private func validateExpressionObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(
+        in: object,
+        supportedKeys: ["kind", "quantity", "parameterID", "name", "quantityKind", "left", "right", "argument"],
+        objectName: path
+    )
+    try validateObjectField("quantity", in: object, path: "\(path).quantity", using: validateQuantityObject)
+    try validateObjectField("left", in: object, path: "\(path).left", using: validateExpressionObject)
+    try validateObjectField("right", in: object, path: "\(path).right", using: validateExpressionObject)
+    try validateObjectField("argument", in: object, path: "\(path).argument", using: validateExpressionObject)
+}
+
+private func validateQuantityObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["value", "kind"], objectName: path)
+}
+
+private func validateDesignGraphObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(
+        in: object,
+        supportedKeys: ["nodes", "order", "dependencies", "revision"],
+        objectName: path
+    )
+    try validateDynamicObjectField("nodes", in: object, path: "\(path).nodes", using: validateFeatureNodeObject)
+    try validateArrayField("dependencies", in: object, path: "\(path).dependencies", using: validateDependencyEdgeObject)
+    try validateObjectField("revision", in: object, path: "\(path).revision", using: validateDocumentRevisionObject)
+}
+
+private func validateDependencyEdgeObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["source", "target"], objectName: path)
+}
+
+private func validateFeatureNodeObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(
+        in: object,
+        supportedKeys: ["id", "name", "operation", "inputs", "outputs", "isSuppressed"],
+        objectName: path
+    )
+    try validateObjectField("operation", in: object, path: "\(path).operation", using: validateFeatureOperationObject)
+    try validateArrayField("inputs", in: object, path: "\(path).inputs", using: validateFeatureInputObject)
+    try validateArrayField("outputs", in: object, path: "\(path).outputs", using: validateFeatureOutputObject)
+}
+
+private func validateFeatureInputObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["featureID", "role"], objectName: path)
+}
+
+private func validateFeatureOutputObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["role", "persistentName"], objectName: path)
+    try validateObjectField("persistentName", in: object, path: "\(path).persistentName", using: validatePersistentNameObject)
+}
+
+private func validatePersistentNameObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["components"], objectName: path)
+    try validateArrayField("components", in: object, path: "\(path).components", using: validateNameComponentObject)
+}
+
+private func validateNameComponentObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["kind", "featureID", "value", "index"], objectName: path)
+}
+
+private func validateFeatureOperationObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["kind", "sketch", "extrude"], objectName: path)
+    try validateObjectField("sketch", in: object, path: "\(path).sketch", using: validateSketchObject)
+    try validateObjectField("extrude", in: object, path: "\(path).extrude", using: validateExtrudeFeatureObject)
+}
+
+private func validateSketchObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(
+        in: object,
+        supportedKeys: ["id", "plane", "entities", "constraints", "dimensions"],
+        objectName: path
+    )
+    try validateObjectField("plane", in: object, path: "\(path).plane", using: validateSketchPlaneObject)
+    try validateDynamicObjectField("entities", in: object, path: "\(path).entities", using: validateSketchEntityObject)
+    try validateArrayField("constraints", in: object, path: "\(path).constraints", using: validateSketchConstraintObject)
+    try validateArrayField("dimensions", in: object, path: "\(path).dimensions", using: validateSketchDimensionObject)
+}
+
+private func validateSketchPlaneObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["kind", "plane"], objectName: path)
+    try validateObjectField("plane", in: object, path: "\(path).plane", using: validatePlane3DObject)
+}
+
+private func validateSketchEntityObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["kind", "point", "line", "circle"], objectName: path)
+    try validateObjectField("point", in: object, path: "\(path).point", using: validateSketchPointObject)
+    try validateObjectField("line", in: object, path: "\(path).line", using: validateSketchLineObject)
+    try validateObjectField("circle", in: object, path: "\(path).circle", using: validateSketchCircleObject)
+}
+
+private func validateSketchPointObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["x", "y"], objectName: path)
+    try validateObjectField("x", in: object, path: "\(path).x", using: validateExpressionObject)
+    try validateObjectField("y", in: object, path: "\(path).y", using: validateExpressionObject)
+}
+
+private func validateSketchLineObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["start", "end"], objectName: path)
+    try validateObjectField("start", in: object, path: "\(path).start", using: validateSketchPointObject)
+    try validateObjectField("end", in: object, path: "\(path).end", using: validateSketchPointObject)
+}
+
+private func validateSketchCircleObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["center", "radius"], objectName: path)
+    try validateObjectField("center", in: object, path: "\(path).center", using: validateSketchPointObject)
+    try validateObjectField("radius", in: object, path: "\(path).radius", using: validateExpressionObject)
+}
+
+private func validateSketchReferenceObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["kind", "entityID"], objectName: path)
+}
+
+private func validateSketchConstraintObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["kind", "first", "second", "entityID"], objectName: path)
+    try validateObjectField("first", in: object, path: "\(path).first", using: validateSketchReferenceObject)
+    try validateObjectField("second", in: object, path: "\(path).second", using: validateSketchReferenceObject)
+}
+
+private func validateSketchDimensionObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["kind", "from", "to", "entityID", "value"], objectName: path)
+    try validateObjectField("from", in: object, path: "\(path).from", using: validateSketchReferenceObject)
+    try validateObjectField("to", in: object, path: "\(path).to", using: validateSketchReferenceObject)
+    try validateObjectField("value", in: object, path: "\(path).value", using: validateExpressionObject)
+}
+
+private func validateExtrudeFeatureObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(
+        in: object,
+        supportedKeys: ["profile", "distance", "direction", "operation"],
+        objectName: path
+    )
+    try validateObjectField("profile", in: object, path: "\(path).profile", using: validateProfileReferenceObject)
+    try validateObjectField("distance", in: object, path: "\(path).distance", using: validateExpressionObject)
+    try validateObjectField("direction", in: object, path: "\(path).direction", using: validateExtrudeDirectionObject)
+}
+
+private func validateProfileReferenceObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["featureID", "profileIndex"], objectName: path)
+}
+
+private func validateExtrudeDirectionObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["kind", "vector"], objectName: path)
+    try validateObjectField("vector", in: object, path: "\(path).vector", using: validateVector3DObject)
+}
+
+private func validatePlane3DObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["origin", "normal"], objectName: path)
+    try validateObjectField("origin", in: object, path: "\(path).origin", using: validatePoint3DObject)
+    try validateObjectField("normal", in: object, path: "\(path).normal", using: validateVector3DObject)
+}
+
+private func validatePoint3DObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["x", "y", "z"], objectName: path)
+}
+
+private func validateVector3DObject(_ object: [String: Any], path: String) throws {
+    try rejectUnsupportedNativeKeys(in: object, supportedKeys: ["x", "y", "z"], objectName: path)
+}
+
+private func nativeJSONObject(from data: Data, name: String) throws -> [String: Any] {
+    do {
+        try rejectDuplicateJSONKeys(in: data, name: name)
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw SchemaError.invalidPackage("\(name) JSON must be an object.")
+        }
+        return object
+    } catch let error as SchemaError {
+        throw error
+    } catch {
+        throw SchemaError.invalidPackage("\(name) JSON is invalid: \(error).")
+    }
+}
+
+private func rejectUnsupportedNativeKeys(
+    in object: [String: Any],
+    supportedKeys: Set<String>,
+    objectName: String
+) throws {
+    let unsupportedKeys = Set(object.keys).subtracting(supportedKeys)
+    guard unsupportedKeys.isEmpty else {
+        let key = unsupportedKeys.sorted().first ?? "unknown"
+        throw SchemaError.invalidPackage("Unsupported native \(objectName) field \(key).")
+    }
+}
+
+private func validateObjectField(
+    _ key: String,
+    in object: [String: Any],
+    path: String,
+    using validator: ([String: Any], String) throws -> Void
+) throws {
+    guard let value = object[key],
+          !(value is NSNull),
+          let nestedObject = value as? [String: Any] else {
+        return
+    }
+    try validator(nestedObject, path)
+}
+
+private func validateDynamicObjectField(
+    _ key: String,
+    in object: [String: Any],
+    path: String,
+    using validator: ([String: Any], String) throws -> Void
+) throws {
+    guard let value = object[key],
+          !(value is NSNull) else {
+        return
+    }
+    if let nestedObject = value as? [String: Any] {
+        try validateDynamicObjectDictionary(nestedObject, path: path, using: validator)
+        return
+    }
+    if let nestedArray = value as? [Any] {
+        try validateDynamicObjectPairs(nestedArray, path: path, using: validator)
+    }
+}
+
+private func validateDynamicObjectDictionary(
+    _ dictionary: [String: Any],
+    path: String,
+    using validator: ([String: Any], String) throws -> Void
+) throws {
+    var logicalKeys: Set<String> = []
+    for nestedKey in dictionary.keys.sorted() {
+        let logicalKey = try canonicalNativeDynamicDictionaryKey(nestedKey, path: path)
+        guard logicalKeys.insert(logicalKey).inserted else {
+            throw SchemaError.invalidPackage("Duplicate native \(path) dictionary key \(nestedKey).")
+        }
+        guard let valueObject = dictionary[nestedKey] as? [String: Any] else {
+            continue
+        }
+        try validator(valueObject, "\(path).\(nestedKey)")
+    }
+}
+
+private func validateDynamicObjectPairs(
+    _ pairs: [Any],
+    path: String,
+    using validator: ([String: Any], String) throws -> Void
+) throws {
+    guard pairs.count.isMultiple(of: 2) else {
+        throw SchemaError.invalidPackage("Native \(path) dictionary must contain key/value pairs.")
+    }
+    var valueIndex = 1
+    var pairIndex = 0
+    var keys: Set<String> = []
+    while valueIndex < pairs.count {
+        guard let key = pairs[valueIndex - 1] as? String,
+              !key.isEmpty else {
+            throw SchemaError.invalidPackage("Native \(path) dictionary key \(pairIndex) must be a string.")
+        }
+        let logicalKey = try canonicalNativeDynamicDictionaryKey(key, path: path)
+        guard keys.insert(logicalKey).inserted else {
+            throw SchemaError.invalidPackage("Duplicate native \(path) dictionary key \(key).")
+        }
+        guard let valueObject = pairs[valueIndex] as? [String: Any] else {
+            valueIndex += 2
+            pairIndex += 1
+            continue
+        }
+        try validator(valueObject, "\(path)[\(pairIndex)]")
+        valueIndex += 2
+        pairIndex += 1
+    }
+}
+
+private func canonicalNativeDynamicDictionaryKey(_ key: String, path: String) throws -> String {
+    guard let uuid = UUID(uuidString: key) else {
+        throw SchemaError.invalidPackage("Native \(path) dictionary key \(key) must be a UUID string.")
+    }
+    return uuid.uuidString
+}
+
+private func validateArrayField(
+    _ key: String,
+    in object: [String: Any],
+    path: String,
+    using validator: ([String: Any], String) throws -> Void
+) throws {
+    guard let value = object[key],
+          !(value is NSNull),
+          let array = value as? [Any] else {
+        return
+    }
+    for (index, element) in array.enumerated() {
+        guard let elementObject = element as? [String: Any] else {
+            continue
+        }
+        try validator(elementObject, "\(path)[\(index)]")
+    }
+}
+
+private func rejectDuplicateJSONKeys(in data: Data, name: String) throws {
+    guard let text = String(data: data, encoding: .utf8) else {
+        throw SchemaError.invalidPackage("\(name) JSON is not UTF-8.")
+    }
+    do {
+        var scanner = JSONDuplicateKeyScanner(text: text)
+        try scanner.validate()
+    } catch let error as SchemaError {
+        throw error
+    } catch {
+        throw SchemaError.invalidPackage("\(name) JSON is invalid: \(error).")
+    }
+}
+
+private struct JSONDuplicateKeyScanner {
+    var text: String
+    var index: String.Index
+
+    init(text: String) {
+        self.text = text
+        self.index = text.startIndex
+    }
+
+    mutating func validate() throws {
+        skipWhitespace()
+        try parseValue()
+        skipWhitespace()
+        guard index == text.endIndex else {
+            throw SchemaError.invalidPackage("JSON contains trailing content.")
+        }
+    }
+
+    private mutating func parseValue() throws {
+        skipWhitespace()
+        guard index < text.endIndex else {
+            throw SchemaError.invalidPackage("JSON value is missing.")
+        }
+        let character = text[index]
+        if character == "{" {
+            try parseObject()
+        } else if character == "[" {
+            try parseArray()
+        } else if character == "\"" {
+            _ = try parseString()
+        } else if character == "-" || character.isNumber {
+            try parseNumber()
+        } else if text[index...].hasPrefix("true") {
+            advance(count: 4)
+        } else if text[index...].hasPrefix("false") {
+            advance(count: 5)
+        } else if text[index...].hasPrefix("null") {
+            advance(count: 4)
+        } else {
+            throw SchemaError.invalidPackage("JSON value is invalid.")
+        }
+    }
+
+    private mutating func parseObject() throws {
+        try consume("{")
+        skipWhitespace()
+        if consumeIfPresent("}") {
+            return
+        }
+        var keys: Set<String> = []
+        while true {
+            skipWhitespace()
+            guard index < text.endIndex, text[index] == "\"" else {
+                throw SchemaError.invalidPackage("JSON object key is missing.")
+            }
+            let key = try parseString()
+            guard keys.insert(key).inserted else {
+                throw SchemaError.invalidPackage("Duplicate JSON key \(key).")
+            }
+            skipWhitespace()
+            try consume(":")
+            try parseValue()
+            skipWhitespace()
+            if consumeIfPresent("}") {
+                return
+            }
+            try consume(",")
+        }
+    }
+
+    private mutating func parseArray() throws {
+        try consume("[")
+        skipWhitespace()
+        if consumeIfPresent("]") {
+            return
+        }
+        while true {
+            try parseValue()
+            skipWhitespace()
+            if consumeIfPresent("]") {
+                return
+            }
+            try consume(",")
+        }
+    }
+
+    private mutating func parseString() throws -> String {
+        try consume("\"")
+        var output = ""
+        while index < text.endIndex {
+            let character = text[index]
+            index = text.index(after: index)
+            if character == "\"" {
+                return output
+            }
+            if character == "\\" {
+                output.append(try parseEscapedCharacter())
+            } else {
+                output.append(character)
+            }
+        }
+        throw SchemaError.invalidPackage("JSON string is unterminated.")
+    }
+
+    private mutating func parseEscapedCharacter() throws -> String {
+        guard index < text.endIndex else {
+            throw SchemaError.invalidPackage("JSON escape is unterminated.")
+        }
+        let character = text[index]
+        index = text.index(after: index)
+        switch character {
+        case "\"":
+            return "\""
+        case "\\":
+            return "\\"
+        case "/":
+            return "/"
+        case "b":
+            return "\u{08}"
+        case "f":
+            return "\u{0c}"
+        case "n":
+            return "\n"
+        case "r":
+            return "\r"
+        case "t":
+            return "\t"
+        case "u":
+            let first = try parseUnicodeEscapeValue()
+            if (0xD800...0xDBFF).contains(first) {
+                try consume("\\")
+                try consume("u")
+                let second = try parseUnicodeEscapeValue()
+                guard (0xDC00...0xDFFF).contains(second) else {
+                    throw SchemaError.invalidPackage("JSON unicode surrogate pair is invalid.")
+                }
+                let value = 0x10000 + ((first - 0xD800) << 10) + (second - 0xDC00)
+                guard let scalar = UnicodeScalar(value) else {
+                    throw SchemaError.invalidPackage("JSON unicode scalar is invalid.")
+                }
+                return String(scalar)
+            }
+            guard !(0xDC00...0xDFFF).contains(first),
+                  let scalar = UnicodeScalar(first) else {
+                throw SchemaError.invalidPackage("JSON unicode scalar is invalid.")
+            }
+            return String(scalar)
+        default:
+            throw SchemaError.invalidPackage("JSON escape is invalid.")
+        }
+    }
+
+    private mutating func parseUnicodeEscapeValue() throws -> UInt32 {
+        var value: UInt32 = 0
+        for _ in 0..<4 {
+            guard index < text.endIndex,
+                  let digit = text[index].hexDigitValue else {
+                throw SchemaError.invalidPackage("JSON unicode escape is invalid.")
+            }
+            value = value * 16 + UInt32(digit)
+            index = text.index(after: index)
+        }
+        return value
+    }
+
+    private mutating func parseNumber() throws {
+        if consumeIfPresent("-") {
+            guard index < text.endIndex else {
+                throw SchemaError.invalidPackage("JSON number is invalid.")
+            }
+        }
+        try parseIntegerPart()
+        if consumeIfPresent(".") {
+            try parseRequiredDigits()
+        }
+        if consumeIfPresent("e") || consumeIfPresent("E") {
+            _ = consumeIfPresent("+") || consumeIfPresent("-")
+            try parseRequiredDigits()
+        }
+    }
+
+    private mutating func parseIntegerPart() throws {
+        guard index < text.endIndex else {
+            throw SchemaError.invalidPackage("JSON number is invalid.")
+        }
+        if text[index] == "0" {
+            index = text.index(after: index)
+            return
+        }
+        guard ("1"..."9").contains(text[index]) else {
+            throw SchemaError.invalidPackage("JSON number is invalid.")
+        }
+        while index < text.endIndex, text[index].isNumber {
+            index = text.index(after: index)
+        }
+    }
+
+    private mutating func parseRequiredDigits() throws {
+        var hasDigit = false
+        while index < text.endIndex, text[index].isNumber {
+            hasDigit = true
+            index = text.index(after: index)
+        }
+        guard hasDigit else {
+            throw SchemaError.invalidPackage("JSON number is invalid.")
+        }
+    }
+
+    private mutating func skipWhitespace() {
+        while index < text.endIndex, text[index].isWhitespace {
+            index = text.index(after: index)
+        }
+    }
+
+    private mutating func consume(_ expected: Character) throws {
+        guard index < text.endIndex, text[index] == expected else {
+            throw SchemaError.invalidPackage("JSON expected \(expected).")
+        }
+        index = text.index(after: index)
+    }
+
+    private mutating func consumeIfPresent(_ expected: Character) -> Bool {
+        guard index < text.endIndex, text[index] == expected else {
+            return false
+        }
+        index = text.index(after: index)
+        return true
+    }
+
+    private mutating func advance(count: Int) {
+        for _ in 0..<count {
+            index = text.index(after: index)
+        }
+    }
+}
