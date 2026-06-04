@@ -253,7 +253,7 @@ The current test suite covers:
 
 | Document | Purpose |
 |---|---|
-| [PHILOSOLY.md](PHILOSOLY.md) | Design philosophy, source-of-truth model, architectural principles |
+| [PHILOSOPHY.md](PHILOSOPHY.md) | Design philosophy, source-of-truth model, architectural principles |
 | [SPEC.md](SPEC.md) | Official support scope, file formats, validation rules, acceptance criteria |
 
 ## Project Principles
