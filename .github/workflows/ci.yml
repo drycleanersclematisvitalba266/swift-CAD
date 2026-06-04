@@ -25,10 +25,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Swift
-        uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: "6.3.1"
+      - name: Install Swift 6.3.1
+        run: |
+          curl -L https://download.swift.org/swiftly/darwin/swiftly.pkg -o swiftly.pkg
+          installer -pkg swiftly.pkg -target CurrentUserHomeDirectory
+          ~/.swiftly/bin/swiftly init --quiet-shell-followup --assume-yes --skip-install
+          . "${SWIFTLY_HOME_DIR:-$HOME/.swiftly}/env.sh"
+          hash -r
+          swiftly install --use 6.3.1
+          echo "$HOME/.swiftly/bin" >> "$GITHUB_PATH"
 
       - name: Show Swift version
         run: swift --version
@@ -59,10 +64,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Swift
-        uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: "6.3.1"
+      - name: Install Swift 6.3.1
+        run: |
+          curl -L https://download.swift.org/swiftly/darwin/swiftly.pkg -o swiftly.pkg
+          installer -pkg swiftly.pkg -target CurrentUserHomeDirectory
+          ~/.swiftly/bin/swiftly init --quiet-shell-followup --assume-yes --skip-install
+          . "${SWIFTLY_HOME_DIR:-$HOME/.swiftly}/env.sh"
+          hash -r
+          swiftly install --use 6.3.1
+          echo "$HOME/.swiftly/bin" >> "$GITHUB_PATH"
 
       - name: Install Swift WebAssembly SDK
         run: |
